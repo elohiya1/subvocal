@@ -5,8 +5,9 @@ from Anthropic's [*Verbalizable Representations Form a Global Workspace in
 Language Models*](https://transformer-circuits.pub/2026/workspace/index.html)
 (2026). Not affiliated with Anthropic.
 
-Wraps [`jlens`](jacobian-lens/), the paper's reference implementation, with
-measurement and debugging tooling; does not reimplement the lens itself.
+Wraps [`jlens`](https://github.com/anthropics/jacobian-lens), the paper's
+reference implementation, with measurement and debugging tooling; does not
+reimplement the lens itself.
 
 **Status: M1 only.** The `Profile` interface and a deterministic `StubLens`
 are in place. Metrics (occupancy, loading, FVE, boundaries), the contrast-pair
