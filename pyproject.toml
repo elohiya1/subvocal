@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subvocal"
+version = "0.1.0"
+description = "Workspace occupancy profiler and prompt debugger built on the Jacobian lens"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "transformers>=5.5",
+    "numpy",
+    "jlens",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["subvocal"]
+
+[tool.uv.sources]
+jlens = { path = "jacobian-lens", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

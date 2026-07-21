@@ -1,0 +1,17 @@
+# Vendored upstream checkout (has its own .git; see README/CLAUDE.md)
+jacobian-lens/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.venv/
+
+# Fitted lens + other run outputs
+artifacts/
+
+# OS
+.DS_Store
