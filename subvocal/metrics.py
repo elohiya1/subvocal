@@ -263,7 +263,14 @@ def occupancy_from_residuals(
         h_batch: Residuals, shape ``(B, d_model)``.
         D: Real J-lens dictionary, shape ``(n_atoms, d_model)``.
         control_D: Size-matched random-direction control, shape
-            ``(>= k_max, d_model)``.
+            ``(n_atoms, d_model)`` -- matched to ``D``'s atom count, not to
+            ``k_max``. A control merely ``>= k_max``-sized but far smaller
+            than ``D`` is a much less overcomplete dictionary, which lets a
+            wildly overcomplete real ``D`` (e.g. a full ~150k-token
+            vocabulary against ``d_model`` in the low thousands) "beat" it at
+            every K almost regardless of real conceptual content -- occupancy
+            never converges below ``k_max`` and excess FVE is inflated by the
+            size gap rather than genuine signal.
         k_max: Upper bound on K to search.
 
     Returns:
@@ -328,7 +335,7 @@ def occupancy_grid(
     grid = np.zeros((len(positions), len(layers)), dtype=np.float32)
     for li, layer in enumerate(layers):
         _, D = concept_dictionary(lens, layer)
-        control_D = random_dictionary(D.shape[1], k_max, seed=seed + layer)
+        control_D = random_dictionary(D.shape[1], D.shape[0], seed=seed + layer)
         h_batch = np.stack([lens.residual(prompt, pos, layer) for pos in positions])
         grid[:, li] = occupancy_from_residuals(h_batch, D, control_D, k_max=k_max)
     return grid
@@ -380,7 +387,7 @@ def fve_per_layer(
     fve_vals = np.zeros(len(layers), dtype=np.float32)
     for li, layer in enumerate(layers):
         _, D = concept_dictionary(lens, layer)
-        control_D = random_dictionary(D.shape[1], k_max, seed=seed + layer)
+        control_D = random_dictionary(D.shape[1], D.shape[0], seed=seed + layer)
         h_batch = np.stack([lens.residual(prompt, pos, layer) for pos in positions])
         k_row = np.clip(occupancy[:, li].astype(np.int64), 1, k_max)
         fve_vals[li] = float(np.mean(fve_from_residuals(h_batch, D, control_D, k_row)))
