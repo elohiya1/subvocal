@@ -9,8 +9,10 @@ Wraps [`jlens`](https://github.com/anthropics/jacobian-lens), the paper's
 reference implementation, with measurement and debugging tooling; does not
 reimplement the lens itself.
 
-**Status: M1 only.** The `Profile` interface and a deterministic `StubLens`
-are in place. Metrics (occupancy, loading, FVE, boundaries), the contrast-pair
+**Status: M1 + M2.** The `Profile` interface, a deterministic `StubLens`, and
+metrics (occupancy via Gradient Pursuit, loading, FVE, the five boundary
+signals) are in place, plus `FittedLens`, wrapping the pinned model
+(`Qwen/Qwen3.5-4B`) and its pre-fitted Jacobian lens. The contrast-pair
 debugger, ablation/steering verification, and the HTML report are not yet
 built — see `CLAUDE.md` for the milestone plan.
 
@@ -52,7 +54,9 @@ tests/
 modal_fit.py    lives outside the package, runs once
 ```
 
-Only `lens.py` and `profile.py` exist so far.
+`lens.py`, `metrics.py`, and `profile.py` exist so far. `debug.py` and
+`report.py` are next; `modal_fit.py` may not be needed at all, since subvocal
+uses the paper's pre-fitted Qwen3.5-4B lens rather than fitting its own.
 
 ## The `Profile` interface
 
@@ -87,3 +91,25 @@ from subvocal.lens import StubLens
 lens = StubLens(n_layers=24, d_model=64, vocab_size=64)
 lens.topk("the quick brown fox", position=2, layer=12, k=5)
 ```
+
+### `FittedLens`
+
+The real thing: `subvocal.lens.FittedLens` wraps a loaded HF model (via
+`jlens.from_hf`) and a fitted `jlens.JacobianLens`, implementing the same
+surface as `StubLens` so `metrics.py` and `Profile` run unchanged against
+either. `FittedLens.from_pretrained()` downloads the pinned model and its
+pre-fitted lens from the Hub — no local fitting run needed:
+
+```python
+from subvocal.lens import FittedLens, QWEN3_5_4B
+
+lens = FittedLens.from_pretrained(QWEN3_5_4B)
+lens.topk("the quick brown fox", position=2, layer=12, k=5)
+```
+
+`residual`/`readout` run the model's real forward pass (cached per prompt);
+`concept_direction` (and the loading/occupancy machinery built on it)
+pulls each concept's unembedding row back through `J_l`, dropping the final
+RMSNorm's data-dependent rescaling — a standard direct-logit-attribution
+linearization, not a paper-verified formula. See the class docstring for the
+full reasoning.

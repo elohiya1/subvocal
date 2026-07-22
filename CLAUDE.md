@@ -25,9 +25,16 @@ debugging tooling on top.
   use float32 and add a CPU-reference test
 - Centralize all device handling in `subvocal/lens.py`. No `.cuda()` or bare
   `.to(device)` anywhere else in the package
-- Model: Qwen (size will be pinned by me before you start Milestone 2)
-- A fitted lens will be at `artifacts/lens.pt`. Until it exists, work against the
-  stub described in Milestone 1
+- Model: pinned to `Qwen/Qwen3.5-4B` (~9.3GB in bf16, fits M4 unified memory).
+  Uses the pre-fitted lens already on the Hub (`neuronpedia/jacobian-lens`,
+  revision `qwen-n1000`) instead of a Modal fitting run -- see
+  `subvocal.lens.QWEN3_5_4B`. It's a hybrid linear-attention/full-attention
+  architecture (`Qwen3_5ForCausalLM`), not a plain transformer; `jlens.from_hf`
+  and `ActivationRecorder` were smoke-tested against it and work (falls back
+  to a pure-PyTorch path for the linear-attention layers, confirmed on MPS)
+- A fitted lens lives at the Hub location above, wrapped by
+  `subvocal.lens.FittedLens`. `StubLens` (Milestone 1) is still what tests run
+  against; only ad hoc sanity-check scripts should load the real model
 
 ## Module layout
 
