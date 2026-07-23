@@ -203,22 +203,31 @@ class FittedLens:
     - :meth:`concept_direction` (and therefore :meth:`loading` in
       ``metrics.py``, plus the Gradient Pursuit dictionaries built from it)
       needs a fixed linear direction per concept, which the real lens doesn't
-      have on its own: ``unembed`` = ``lm_head`` after a final RMSNorm, and
-      RMSNorm's per-example denominator makes the true readout direction
-      depend on the residual itself. This class approximates it by pulling
-      the unembedding row for the concept's token back through ``J_l``
-      *without* the norm (``direction_l = w_token @ J_l``) -- the same
-      linearization "direct logit attribution" / logit-lens tooling uses
-      elsewhere, dropping only the norm's data-dependent rescaling, not its
-      learned per-channel gain (already folded into ``J_l`` for layers near
-      the output). This is a judgment call, not a paper-verified formula.
+      have on its own: ``unembed`` = ``lm_head`` after a final RMSNorm
+      (``g * x / rms(x)``), and RMSNorm's per-example denominator ``rms(x)``
+      makes the true readout direction depend on the residual itself. This
+      class approximates it by pulling the unembedding row for the concept's
+      token back through ``J_l`` *without* that denominator
+      (``direction_l = (w_token * g) @ J_l``) -- the same linearization
+      "direct logit attribution" / logit-lens tooling uses elsewhere. This is
+      exact for anything scale-invariant in the readout direction (cosine
+      similarity, top-k ranking): ``rms(x)`` is a single positive scalar
+      shared by every concept at a given ``(prompt, position, layer)``, since
+      ``x = J_l @ h`` doesn't depend on which concept is being read out, so
+      dropping it changes no ranking or cosine similarity. The learned
+      per-channel gain ``g`` is *not* dropped -- it does not appear in ``J_l``
+      (which is fit purely on pre-norm residuals; ``g`` is only applied
+      downstream, inside ``unembed``) and omitting it measurably hurt
+      reconstruction quality in practice. This is a judgment call, not a
+      paper-verified formula.
 
     Caches aggressively per CLAUDE.md: one forward pass per prompt covers
     every layer's residual (:meth:`residual`) and feeds :meth:`readout`
     without rerunning the model; per-layer concept-direction matrices
-    (:meth:`concept_direction`) are built once from ``W_U @ J_l`` and reused
-    across all vocab lookups at that layer, so the ``concept_dictionary``
-    loop in ``metrics.py`` stays cheap even over a real ~150k-token vocab.
+    (:meth:`concept_direction`) are built once from ``(W_U * g) @ J_l`` and
+    reused across all vocab lookups at that layer, so the
+    ``concept_dictionary`` loop in ``metrics.py`` stays cheap even when it
+    draws its default-sized sample from a real ~250k-token vocab.
     Call :meth:`clear_cache` to release it (e.g. between prompts/chunks, per
     CLAUDE.md's ``torch.mps.empty_cache()`` guidance).
     """
@@ -251,6 +260,20 @@ class FittedLens:
         self._unembed_matrix = (
             output_embeddings.weight.detach().to(torch.float32).cpu().numpy()
         )  # (vocab_size, d_model)
+
+        # The final RMSNorm's learned per-channel gain, applied downstream of
+        # J_l (see the class docstring) -- reached off jlens's own layout
+        # detection (`_final_norm`) rather than re-deriving which module that
+        # is per architecture, since that's exactly the "don't reimplement
+        # the lens" line CLAUDE.md draws. Falls back to an identity gain if
+        # the resolved norm module has no `.weight` (e.g. a bias-free,
+        # non-affine norm), rather than assuming every architecture has one.
+        final_norm_weight = getattr(self._model._final_norm, "weight", None)
+        self._final_norm_gain: np.ndarray = (
+            final_norm_weight.detach().to(torch.float32).cpu().numpy()
+            if final_norm_weight is not None
+            else np.ones(self.d_model, dtype=np.float32)
+        )
 
         self._vocab_cache: list[str] | None = None
         self._residual_cache: dict[str, dict[int, torch.Tensor]] = {}
@@ -321,7 +344,7 @@ class FittedLens:
             # First occurrence wins on decode collisions; used by _token_id
             # to skip re-tokenizing strings that are already known vocab
             # entries -- the common case when metrics.py's concept_dictionary
-            # sweeps the full vocab as its default dictionary.
+            # draws its default sample from this vocab.
             for i, tok in enumerate(self._vocab_cache):
                 self._token_id_cache.setdefault(tok, i)
         return self._vocab_cache
@@ -364,18 +387,22 @@ class FittedLens:
         return acts[layer][pos].numpy()
 
     def _directions_for_layer(self, layer: int) -> np.ndarray:
-        """``W_U @ J_l``: a ``(vocab_size, d_model)`` matmul, cheap enough to
-        do once per layer but big enough (full vocab, e.g. ~150k rows) to be
-        worth running on-device rather than in CPU numpy. At the final layer
-        ``J_l`` is the identity (see :meth:`_is_final_layer`), so the
-        directions are just ``W_U`` itself. LRU-bounded (see the cache's
+        """``(W_U * g) @ J_l``: a ``(vocab_size, d_model)`` matmul, cheap
+        enough to do once per layer but big enough (full vocab, e.g. ~250k
+        rows) to be worth running on-device rather than in CPU numpy. ``g``
+        is the final RMSNorm's gain (see the class docstring for why it's
+        included but the norm's data-dependent denominator isn't). At the
+        final layer ``J_l`` is the identity (see :meth:`_is_final_layer`), so
+        the directions are just ``W_U * g``. LRU-bounded (see the cache's
         declaration in ``__init__``); moves ``layer`` to most-recently-used
         on every hit."""
         cached = self._direction_cache.get(layer)
         if cached is not None:
             self._direction_cache.move_to_end(layer)
             return cached
-        W_U = torch.from_numpy(self._unembed_matrix).to(self.device)
+        W_U = torch.from_numpy(self._unembed_matrix * self._final_norm_gain[None, :]).to(
+            self.device
+        )
         if self._is_final_layer(layer):
             directions = W_U.float().cpu().numpy()
         else:

@@ -78,14 +78,50 @@ def reindex_to_depth(layer: int, n_layers: int) -> float:
 # --------------------------------------------------------------------------
 
 
+#: Default cap on dictionary size when ``concepts`` isn't given explicitly.
+#: A same-size random control's greedy-selected variance explained grows with
+#: pool size alone (no real structure needed): empirically ~0.9% at 50 atoms
+#: vs ~7.4% at 1000 atoms (K=40, real Qwen3.5-4B residuals) -- greedy pursuit
+#: over a huge pool can always cherry-pick a near-duplicate of whatever it's
+#: reconstructing. Matching control size to an uncapped real dictionary (the
+#: full ~250k-token vocab) pushed that noise floor (~0.15 VE) *above* what the
+#: real dictionary achieves, which silently swallows genuine signal and is
+#: exactly backwards from the fix's intent. Capping both sides to 200 (5x the
+#: default k_max=40 -- comfortably overcomplete relative to the paper's
+#: ~25-concept occupancy plateau) keeps that noise floor around 3.5%, well
+#: under CLAUDE.md's <=10% FVE ceiling.
+DEFAULT_DICTIONARY_SIZE = 200
+
+
 def concept_dictionary(
-    lens: MetricsLens, layer: int, concepts: Sequence[str] | None = None
+    lens: MetricsLens,
+    layer: int,
+    concepts: Sequence[str] | None = None,
+    *,
+    max_atoms: int = DEFAULT_DICTIONARY_SIZE,
+    seed: int = 0,
 ) -> tuple[list[str], np.ndarray]:
-    """J-lens vectors at ``layer`` for ``concepts`` (default: full vocab).
+    """J-lens vectors at ``layer`` for ``concepts``.
+
+    ``concepts=None`` (the default) draws a size-``max_atoms`` sample from the
+    vocab rather than using it whole -- see :data:`DEFAULT_DICTIONARY_SIZE`.
+    The sample is seeded independently of ``layer``, so repeated calls across
+    layers (e.g. from :func:`cka_signal`) draw the *same* concept subset,
+    which is what makes a cross-layer comparison meaningful. Explicit
+    ``concepts`` are never subsampled -- that's the caller's deliberate
+    choice. Vocabularies no larger than ``max_atoms`` are used whole.
 
     Returns ``(concepts, D)`` where ``D`` has shape ``(n_concepts, d_model)``.
     """
-    names = list(concepts) if concepts is not None else list(lens.vocab)
+    if concepts is not None:
+        names = list(concepts)
+    else:
+        vocab = list(lens.vocab)
+        if len(vocab) <= max_atoms:
+            names = vocab
+        else:
+            idx = np.random.default_rng(seed).choice(len(vocab), size=max_atoms, replace=False)
+            names = [vocab[i] for i in sorted(idx.tolist())]
     D = np.stack([lens.concept_direction(c, layer) for c in names]).astype(np.float32)
     return names, D
 
@@ -265,12 +301,17 @@ def occupancy_from_residuals(
         control_D: Size-matched random-direction control, shape
             ``(n_atoms, d_model)`` -- matched to ``D``'s atom count, not to
             ``k_max``. A control merely ``>= k_max``-sized but far smaller
-            than ``D`` is a much less overcomplete dictionary, which lets a
-            wildly overcomplete real ``D`` (e.g. a full ~150k-token
-            vocabulary against ``d_model`` in the low thousands) "beat" it at
-            every K almost regardless of real conceptual content -- occupancy
-            never converges below ``k_max`` and excess FVE is inflated by the
-            size gap rather than genuine signal.
+            than ``D`` is a much less overcomplete dictionary, which would let
+            a much bigger real ``D`` "beat" it at every K almost regardless of
+            real conceptual content. Matching sizes only controls for this
+            *relative* imbalance, though -- it does not make either side safe
+            to grow without bound: a greedy pursuit's selected variance
+            explained rises with pool size on pure noise alone (more random
+            candidates means a better chance of a near-duplicate to whatever
+            is being reconstructed), so both ``D`` and ``control_D`` need to
+            stay at a bounded, moderate size for the comparison to mean
+            anything. See :data:`DEFAULT_DICTIONARY_SIZE` for that bound and
+            the measurements behind it.
         k_max: Upper bound on K to search.
 
     Returns:
