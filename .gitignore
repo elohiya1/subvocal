@@ -1,6 +1,3 @@
-# Vendored upstream checkout (has its own .git; see README/CLAUDE.md)
-jacobian-lens/
-
 # Python
 __pycache__/
 *.pyc
