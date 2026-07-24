@@ -18,39 +18,13 @@ import transformers
 from subvocal import metrics
 from subvocal.lens import FittedLens
 
+# tiny_fitted_lens (the fixture built from these) lives in conftest.py, shared
+# with test_debug.py's M4 tests; PROMPTS is duplicated here rather than
+# imported cross-module, since it's only ever used as inline literal text.
 PROMPTS = [
     "The quick brown fox jumps over the lazy dog near the river bank today.",
     "Scientists discovered a new species of beetle living deep within the cave system.",
 ]
-
-
-@pytest.fixture(scope="module")
-def tiny_fitted_lens() -> FittedLens:
-    torch.manual_seed(0)
-    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
-    config = transformers.Qwen3Config(
-        vocab_size=len(tokenizer),
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=3,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-        tie_word_embeddings=False,
-    )
-    model = transformers.Qwen3ForCausalLM(config)
-    lens_model = jlens.from_hf(model, tokenizer)
-    jacobian_lens = jlens.fit(
-        lens_model,
-        PROMPTS,
-        source_layers=[0, 1],
-        target_layer=2,
-        dim_batch=4,
-        max_seq_len=32,
-        skip_first=2,
-        checkpoint_every=None,
-    )
-    return FittedLens(model, tokenizer, jacobian_lens, device="cpu")
 
 
 class TestFittedLens:

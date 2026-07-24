@@ -1,6 +1,14 @@
-"""Prompt debugging on top of ``metrics.py``: :func:`probe` and :func:`contrast`,
-CLAUDE.md's first two M3 modes. ``propose()`` is a stretch goal and is not
-implemented here.
+"""Prompt debugging built on ``metrics.py``: M3's :func:`probe` and
+:func:`contrast` (``propose()`` is a stretch goal and is not implemented
+here), plus M4's :func:`verify_ablate` and :func:`verify_steer`.
+
+M3's two functions are typed against :class:`~subvocal.metrics.MetricsLens`
+and run against either lens. M4's two are typed against
+:class:`InterventionLens` instead: ablation/steering needs a real
+forward-pass re-run past the intervened layer, which is fundamentally
+something a real model provides and a fake one can't -- see
+:meth:`~subvocal.lens.FittedLens.ablate`'s docstring. Only
+:class:`~subvocal.lens.FittedLens` implements it.
 """
 
 from __future__ import annotations
@@ -8,6 +16,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
@@ -17,6 +26,7 @@ from subvocal.metrics import (
     concept_dictionary,
     cosine_loading,
     loading_grid,
+    random_dictionary,
     reindex_to_depth,
     subsample_layers,
 )
@@ -43,13 +53,31 @@ def _warn_if_multi_token(lens: MetricsLens, concept: str) -> None:
     on a :class:`~subvocal.lens.StubLens` doesn't actually require single
     tokens; :class:`~subvocal.lens.FittedLens` will separately raise when it
     can't resolve a single token id.
+
+    Prefers the lens's own ``token_id()`` (when it has one, i.e.
+    :class:`~subvocal.lens.FittedLens`) over ``len(lens.encode(concept))``:
+    ``encode()`` tokenizes ``concept`` as if it were a whole prompt, which
+    for a tokenizer configured to prepend a BOS token would always come back
+    as "2 tokens" regardless of ``concept`` -- a false positive that doesn't
+    match what ``concept_direction()`` actually enforces
+    (``tokenizer.encode(concept, add_special_tokens=False)``). Falls back to
+    ``encode()`` for lenses without ``token_id()`` (e.g. :class:`~subvocal.lens.StubLens`,
+    which has no real single-token constraint to check against anyway).
     """
-    n_tokens = len(lens.encode(concept))
-    if n_tokens != 1:
+    token_id = getattr(lens, "token_id", None)
+    if callable(token_id):
+        try:
+            token_id(concept)
+            is_single = True
+        except ValueError:
+            is_single = False
+    else:
+        is_single = len(lens.encode(concept)) == 1
+    if not is_single:
         warnings.warn(
-            f"concept {concept!r} tokenizes to {n_tokens} tokens under this "
-            "lens's tokenizer; the lens only reads out single tokens, so "
-            "this reflects at most the first token's meaning, not the "
+            f"concept {concept!r} does not resolve to a single token under "
+            "this lens's tokenizer; the lens only reads out single tokens, "
+            "so this reflects at most the first token's meaning, not the "
             "phrase as a whole.",
             stacklevel=3,
         )
@@ -337,4 +365,300 @@ def contrast(
         layers=layers,
         band=band,
         hits=hits,
+    )
+
+
+# --------------------------------------------------------------------------
+# verify_ablate / verify_steer (M4)
+# --------------------------------------------------------------------------
+
+
+class InterventionLens(MetricsLens, Protocol):
+    """What :func:`verify_ablate`/:func:`verify_steer` need beyond
+    :class:`~subvocal.metrics.MetricsLens`: real forward-pass intervention.
+    ``d_model`` is needed to size the random-direction control.
+    """
+
+    d_model: int
+
+    def token_id(self, token: str) -> int: ...
+    def ablate(self, prompt: str, layer_directions: dict[int, np.ndarray]) -> np.ndarray: ...
+    def steer(
+        self, prompt: str, layer_directions: dict[int, np.ndarray], alpha: float
+    ) -> np.ndarray: ...
+
+
+def _final_position(lens: InterventionLens, prompt: str) -> int:
+    return len(lens.encode(prompt)) - 1
+
+
+def _ablation_layers(lens: InterventionLens, layers: Sequence[int] | None) -> list[int]:
+    """Layers to intervene at, per CLAUDE.md's "workspace band" convention --
+    with the model's actual final layer always excluded, since intervening
+    there is mechanically just editing the logits directly (no residual
+    stream left for a later layer to process), not a hidden-state
+    intervention at all."""
+    layers = list(layers) if layers is not None else subsample_layers(lens.n_layers)
+    return [l for l in layers if l != lens.n_layers - 1]
+
+
+def _rank_of(logits: np.ndarray, token_id: int) -> int:
+    """0-indexed rank of ``token_id`` in ``logits`` (0 = top prediction)."""
+    return int((logits > logits[token_id]).sum())
+
+
+@dataclass(frozen=True)
+class AblationOutcome:
+    """One side (concept or random-direction control) of a
+    :func:`verify_ablate` check.
+
+    Attributes:
+        top1_before: The model's top prediction before ablation.
+        top1_after: Its top prediction after.
+        answer_changed: Whether ``top1_before != top1_after``.
+        top1_logit_before: ``top1_before``'s logit before ablation.
+        top1_logit_after: ``top1_before``'s logit after ablation (how much
+            the *original* answer was suppressed, even if it's still top-1).
+    """
+
+    top1_before: str
+    top1_after: str
+    answer_changed: bool
+    top1_logit_before: float
+    top1_logit_after: float
+
+
+@dataclass(frozen=True)
+class VerifyAblateResult:
+    """CLAUDE.md's M4 necessity check, concept vs. required random-direction
+    control, always reported side by side.
+
+    Attributes:
+        prompt: The prompt checked.
+        concept: The concept ablated.
+        layers: Layers ablated at (final layer always excluded; see
+            :func:`verify_ablate`).
+        skipped: True if ablation wasn't run at all.
+        skip_reason: Why, when ``skipped``.
+        concept_outcome: Effect of ablating ``concept``'s direction. ``None``
+            when ``skipped``.
+        control_outcome: Effect of ablating a matched random direction at the
+            same layers. ``None`` when ``skipped``.
+    """
+
+    prompt: str
+    concept: str
+    layers: list[int]
+    skipped: bool
+    skip_reason: str | None
+    concept_outcome: AblationOutcome | None
+    control_outcome: AblationOutcome | None
+
+
+def verify_ablate(
+    lens: InterventionLens,
+    prompt: str,
+    concept: str,
+    *,
+    layers: Sequence[int] | None = None,
+    top_k_skip: int = 10,
+    seed: int = 0,
+) -> VerifyAblateResult:
+    """Project ``concept``'s direction out of the residual stream across
+    ``layers`` and confirm the model's answer actually changes.
+
+    CLAUDE.md's M4 necessity check. Per the paper's convention, skipped
+    entirely when ``concept`` is already in the clean forward pass's top-
+    ``top_k_skip`` prediction -- ablating there would just remove the token
+    from its own imminent output (the "report"), which isn't a test of
+    whether the model used the concept in internal reasoning. Always runs
+    and reports a random-direction control matched for norm (unit vector,
+    like the real direction) and layer band, per CLAUDE.md: "Without it any
+    effect could be generic perturbation damage."
+
+    Args:
+        lens: An :class:`InterventionLens` (only :class:`~subvocal.lens.FittedLens`
+            qualifies).
+        prompt: The prompt to check.
+        concept: The concept to ablate.
+        layers: Layers to ablate at. Defaults to
+            :func:`~subvocal.metrics.subsample_layers`, final layer excluded.
+        top_k_skip: Skip threshold (CLAUDE.md says "top-10" specifically;
+            exposed as a parameter since that's a judgment call, not a
+            paper-pinned constant).
+        seed: Random-control direction seed.
+
+    Returns:
+        A :class:`VerifyAblateResult`.
+    """
+    _warn_if_multi_token(lens, concept)
+    layers = _ablation_layers(lens, layers)
+    position = _final_position(lens, prompt)
+    final_layer = lens.n_layers - 1
+
+    clean_logits = lens.readout(prompt, position, final_layer)
+    clean_top = lens.topk(prompt, position, final_layer, k=top_k_skip)
+    if concept in {tok for tok, _ in clean_top}:
+        return VerifyAblateResult(
+            prompt=prompt,
+            concept=concept,
+            layers=layers,
+            skipped=True,
+            skip_reason=(
+                f"{concept!r} is already in the clean forward pass's top-"
+                f"{top_k_skip} prediction ({[t for t, _ in clean_top]}); "
+                "ablating it would only remove it from its own imminent "
+                "output, not test internal use."
+            ),
+            concept_outcome=None,
+            control_outcome=None,
+        )
+
+    top1_id = lens.token_id(clean_top[0][0])
+    top1_before = clean_top[0][0]
+    top1_logit_before = float(clean_logits[top1_id])
+
+    def outcome(after_logits: np.ndarray) -> AblationOutcome:
+        top1_after_id = int(np.argmax(after_logits))
+        top1_after = lens.vocab[top1_after_id]
+        return AblationOutcome(
+            top1_before=top1_before,
+            top1_after=top1_after,
+            answer_changed=top1_after != top1_before,
+            top1_logit_before=top1_logit_before,
+            top1_logit_after=float(after_logits[top1_id]),
+        )
+
+    concept_dirs = {l: lens.concept_direction(concept, l) for l in layers}
+    concept_after = lens.ablate(prompt, concept_dirs)[position]
+
+    control_vecs = random_dictionary(lens.d_model, len(layers), seed=seed)
+    control_dirs = dict(zip(layers, control_vecs))
+    control_after = lens.ablate(prompt, control_dirs)[position]
+
+    return VerifyAblateResult(
+        prompt=prompt,
+        concept=concept,
+        layers=layers,
+        skipped=False,
+        skip_reason=None,
+        concept_outcome=outcome(concept_after),
+        control_outcome=outcome(control_after),
+    )
+
+
+@dataclass(frozen=True)
+class SteerOutcome:
+    """One side (concept or random-direction control) of a
+    :func:`verify_steer` check.
+
+    Attributes:
+        rank_before: ``concept``'s 0-indexed rank in the clean prediction
+            (0 = top-1).
+        rank_after: Its rank after steering.
+        entered_topk: Whether ``rank_after < k`` -- CLAUDE.md's "check
+            recovery": did steering bring the concept into the visible
+            output at all.
+        logit_before: ``concept``'s logit before steering.
+        logit_after: Its logit after.
+    """
+
+    rank_before: int
+    rank_after: int
+    entered_topk: bool
+    logit_before: float
+    logit_after: float
+
+
+@dataclass(frozen=True)
+class VerifySteerResult:
+    """CLAUDE.md's M4 sufficiency check, concept vs. required random-direction
+    control, always reported side by side.
+
+    Attributes:
+        prompt: The prompt checked.
+        concept: The concept steered in.
+        alpha: Steering magnitude used.
+        layers: Layers steered at (final layer always excluded; see
+            :func:`verify_ablate`).
+        concept_outcome: Effect of steering ``concept``'s direction in.
+        control_outcome: Effect of steering a matched random direction in at
+            the same layers and ``alpha``.
+    """
+
+    prompt: str
+    concept: str
+    alpha: float
+    layers: list[int]
+    concept_outcome: SteerOutcome
+    control_outcome: SteerOutcome
+
+
+def verify_steer(
+    lens: InterventionLens,
+    prompt: str,
+    concept: str,
+    alpha: float,
+    *,
+    layers: Sequence[int] | None = None,
+    k: int = 25,
+    seed: int = 0,
+) -> VerifySteerResult:
+    """Add ``alpha`` times ``concept``'s direction into the residual stream
+    across ``layers`` and check whether it recovers into the visible output.
+
+    CLAUDE.md's M4 sufficiency check, the counterpart to :func:`verify_ablate`'s
+    necessity check. Always runs and reports a random-direction control
+    matched for norm and layer band, same as :func:`verify_ablate`.
+
+    Args:
+        lens: An :class:`InterventionLens` (only :class:`~subvocal.lens.FittedLens`
+            qualifies).
+        prompt: The prompt to check.
+        concept: The concept to steer in.
+        alpha: Steering magnitude (added as ``alpha`` times a unit vector at
+            each layer).
+        layers: Layers to steer at. Defaults to
+            :func:`~subvocal.metrics.subsample_layers`, final layer excluded.
+        k: Top-k threshold "recovery" (:attr:`SteerOutcome.entered_topk`) is
+            judged against.
+        seed: Random-control direction seed.
+
+    Returns:
+        A :class:`VerifySteerResult`.
+    """
+    _warn_if_multi_token(lens, concept)
+    layers = _ablation_layers(lens, layers)
+    position = _final_position(lens, prompt)
+    final_layer = lens.n_layers - 1
+    concept_id = lens.token_id(concept)
+
+    clean_logits = lens.readout(prompt, position, final_layer)
+    rank_before = _rank_of(clean_logits, concept_id)
+    logit_before = float(clean_logits[concept_id])
+
+    def outcome(after_logits: np.ndarray) -> SteerOutcome:
+        rank_after = _rank_of(after_logits, concept_id)
+        return SteerOutcome(
+            rank_before=rank_before,
+            rank_after=rank_after,
+            entered_topk=rank_after < k,
+            logit_before=logit_before,
+            logit_after=float(after_logits[concept_id]),
+        )
+
+    concept_dirs = {l: lens.concept_direction(concept, l) for l in layers}
+    concept_after = lens.steer(prompt, concept_dirs, alpha)[position]
+
+    control_vecs = random_dictionary(lens.d_model, len(layers), seed=seed)
+    control_dirs = dict(zip(layers, control_vecs))
+    control_after = lens.steer(prompt, control_dirs, alpha)[position]
+
+    return VerifySteerResult(
+        prompt=prompt,
+        concept=concept,
+        alpha=alpha,
+        layers=layers,
+        concept_outcome=outcome(concept_after),
+        control_outcome=outcome(control_after),
     )

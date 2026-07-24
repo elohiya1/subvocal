@@ -1,4 +1,14 @@
-"""Tests for debug.py's probe() and contrast()."""
+"""Tests for debug.py's probe(), contrast(), verify_ablate(), and verify_steer().
+
+verify_ablate/verify_steer need a real forward-pass re-run past the
+intervened layer, so unlike probe/contrast they're tested against the
+tiny_fitted_lens fixture (conftest.py) rather than StubLens or _ToyLens --
+see InterventionLens's docstring in debug.py. The tiny model's weights are
+randomly initialized, so these tests check structural correctness (shapes,
+types, skip logic, that an intervention actually perturbs the forward pass)
+rather than asserting any particular causal direction of effect, which isn't
+meaningful for an untrained model.
+"""
 
 from __future__ import annotations
 
@@ -76,7 +86,7 @@ class TestProbe:
 
     def test_warns_on_multi_token_concept(self):
         lens = StubLens(n_layers=4, d_model=8, vocab_size=8)
-        with pytest.warns(UserWarning, match="tokenizes to"):
+        with pytest.warns(UserWarning, match="single token"):
             debug.probe(lens, "a b c", "multi word concept", layers=[0])
 
     def test_no_warning_on_single_token_concept(self, recwarn):
@@ -130,7 +140,7 @@ class TestContrast:
 
     def test_warns_on_multi_token_explicit_concept(self):
         lens = StubLens(n_layers=4, d_model=8, vocab_size=8)
-        with pytest.warns(UserWarning, match="tokenizes to"):
+        with pytest.warns(UserWarning, match="single token"):
             debug.contrast(
                 lens, "a b", "c d", concepts=["multi word concept"], layers=[0]
             )
@@ -198,3 +208,85 @@ class TestContrast:
             baseline_prompts=[baseline],
         )
         assert band_zero_only.hits[0].concept == "other"
+
+
+# --------------------------------------------------------------------------
+# verify_ablate / verify_steer
+# --------------------------------------------------------------------------
+
+_PROMPT = "The quick brown fox jumps over the lazy dog near the river bank today."
+
+
+class TestVerifyAblate:
+    def test_excludes_final_layer_by_default(self, tiny_fitted_lens):
+        result = debug.verify_ablate(tiny_fitted_lens, _PROMPT, " fox")
+        assert tiny_fitted_lens.n_layers - 1 not in result.layers
+        assert result.layers == [0, 1]
+
+    def test_skips_when_concept_in_clean_topk(self, tiny_fitted_lens):
+        final_layer = tiny_fitted_lens.n_layers - 1
+        position = len(tiny_fitted_lens.encode(_PROMPT)) - 1
+        top1 = tiny_fitted_lens.topk(_PROMPT, position, final_layer, k=1)[0][0]
+
+        result = debug.verify_ablate(tiny_fitted_lens, _PROMPT, top1, top_k_skip=10)
+        assert result.skipped is True
+        assert result.skip_reason is not None
+        assert result.concept_outcome is None
+        assert result.control_outcome is None
+
+    def test_runs_and_reports_control_side_by_side(self, tiny_fitted_lens):
+        final_layer = tiny_fitted_lens.n_layers - 1
+        position = len(tiny_fitted_lens.encode(_PROMPT)) - 1
+        # Pick a concept guaranteed *not* to be skipped: the lowest-ranked
+        # single token in the clean readout.
+        low_rank_token = tiny_fitted_lens.topk(
+            _PROMPT, position, final_layer, k=len(tiny_fitted_lens.vocab)
+        )[-1][0]
+
+        result = debug.verify_ablate(
+            tiny_fitted_lens, _PROMPT, low_rank_token, top_k_skip=10
+        )
+        assert result.skipped is False
+        assert isinstance(result.concept_outcome, debug.AblationOutcome)
+        assert isinstance(result.control_outcome, debug.AblationOutcome)
+        # A real ablation perturbs the forward pass; the original top-1
+        # token's logit essentially never lands back exactly on its clean
+        # value by coincidence.
+        assert result.concept_outcome.top1_logit_after != pytest.approx(
+            result.concept_outcome.top1_logit_before, abs=1e-6
+        )
+        assert result.control_outcome.top1_logit_after != pytest.approx(
+            result.control_outcome.top1_logit_before, abs=1e-6
+        )
+
+    def test_warns_on_multi_token_concept(self, tiny_fitted_lens):
+        with pytest.warns(UserWarning, match="single token"):
+            with pytest.raises(ValueError, match="tokenizes to"):
+                debug.verify_ablate(tiny_fitted_lens, _PROMPT, "multi token phrase")
+
+
+class TestVerifySteer:
+    def test_excludes_final_layer_by_default(self, tiny_fitted_lens):
+        result = debug.verify_steer(tiny_fitted_lens, _PROMPT, " fox", alpha=5.0)
+        assert tiny_fitted_lens.n_layers - 1 not in result.layers
+        assert result.layers == [0, 1]
+
+    def test_runs_and_reports_control_side_by_side(self, tiny_fitted_lens):
+        result = debug.verify_steer(tiny_fitted_lens, _PROMPT, " fox", alpha=10.0, k=5)
+        assert isinstance(result.concept_outcome, debug.SteerOutcome)
+        assert isinstance(result.control_outcome, debug.SteerOutcome)
+        assert result.concept_outcome.rank_before >= 0
+        assert result.concept_outcome.rank_after >= 0
+        assert result.concept_outcome.logit_after != pytest.approx(
+            result.concept_outcome.logit_before, abs=1e-6
+        )
+
+    def test_entered_topk_matches_rank(self, tiny_fitted_lens):
+        result = debug.verify_steer(tiny_fitted_lens, _PROMPT, " fox", alpha=10.0, k=5)
+        assert result.concept_outcome.entered_topk == (result.concept_outcome.rank_after < 5)
+        assert result.control_outcome.entered_topk == (result.control_outcome.rank_after < 5)
+
+    def test_warns_on_multi_token_concept(self, tiny_fitted_lens):
+        with pytest.warns(UserWarning, match="single token"):
+            with pytest.raises(ValueError, match="tokenizes to"):
+                debug.verify_steer(tiny_fitted_lens, _PROMPT, "multi token phrase", alpha=1.0)

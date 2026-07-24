@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import jlens
@@ -468,3 +468,118 @@ class FittedLens:
         self._residual_cache.clear()
         self._direction_cache.clear()
         empty_cache(self.device)
+
+    @property
+    def model(self) -> jlens.LensModel:
+        """The underlying jlens-wrapped model, for code (e.g. ``report.py``)
+        that needs jlens's own APIs (e.g. ``jlens.vis``) directly rather than
+        this class's readout surface. Public so that code stays out of
+        ``FittedLens``'s private attributes across module boundaries."""
+        return self._model
+
+    @property
+    def jacobian_lens(self) -> jlens.JacobianLens:
+        """The underlying fitted lens. Same reasoning as :attr:`model`."""
+        return self._jacobian_lens
+
+    def token_id(self, token: str) -> int:
+        """The vocab id for a single-token string. Raises the same way
+        :meth:`concept_direction` does if ``token`` isn't exactly one token
+        -- exposed publicly for M4's ablation/steering verification, which
+        needs to index a real logits vector by token, not just rank/score it
+        via :meth:`topk`."""
+        return self._token_id(token)
+
+    def _make_intervention_hook(
+        self, fn: Callable[[torch.Tensor], torch.Tensor]
+    ) -> Callable[..., torch.Tensor | tuple]:
+        """Wrap ``fn`` (a pure tensor -> tensor transform) as a
+        ``register_forward_hook`` callback. A hook that returns a non-``None``
+        value replaces the block's output, which is what lets
+        :meth:`ablate`/:meth:`steer` modify the residual stream mid-forward-pass
+        and have the *real* remaining layers propagate the change -- unlike
+        :meth:`readout`, which only ever applies the linear ``J_l`` transport,
+        never re-runs the actual model past the source layer."""
+
+        def hook(module: torch.nn.Module, inputs: object, output: object) -> torch.Tensor | tuple:
+            tensor = output if torch.is_tensor(output) else output[0]
+            modified = fn(tensor)
+            return modified if torch.is_tensor(output) else (modified, *output[1:])
+
+        return hook
+
+    def _direction_transform(
+        self, direction: np.ndarray, *, mode: str, alpha: float = 0.0
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
+        """Build the per-layer tensor transform :meth:`ablate`/:meth:`steer`
+        hook with. ``direction`` is unit-normalized here (on-device, matching
+        the intervened tensor's dtype) regardless of its incoming scale --
+        ``concept_direction()`` rows aren't unit-norm themselves, and CLAUDE.md's
+        required random-direction control needs to remove/add a
+        norm-*matched* perturbation to mean anything as a control."""
+        direction_np = np.asarray(direction, dtype=np.float32)
+
+        def fn(tensor: torch.Tensor) -> torch.Tensor:
+            unit = torch.from_numpy(direction_np).to(tensor.device, tensor.dtype)
+            unit = unit / unit.norm()
+            if mode == "ablate":
+                coeff = torch.einsum("...d,d->...", tensor, unit)
+                return tensor - coeff.unsqueeze(-1) * unit
+            return tensor + alpha * unit
+
+        return fn
+
+    def _intervened_logits(
+        self, prompt: str, layer_transforms: dict[int, Callable[[torch.Tensor], torch.Tensor]]
+    ) -> np.ndarray:
+        """Real forward pass with each listed layer's output transformed
+        before the rest of the stack sees it. Not cached (unlike
+        :meth:`residual`) and not the linear ``J_l`` approximation
+        :meth:`readout` uses -- this re-runs the actual remaining layers, so
+        the result reflects the model's real post-intervention behavior.
+        Each call is a fresh forward pass; verification runs are occasional,
+        not a hot metrics loop, so this doesn't need the caching CLAUDE.md
+        asks for elsewhere. Shape ``(seq_len, vocab_size)``.
+        """
+        input_ids = self._model.encode(prompt)
+        final_layer = self.n_layers - 1
+        handles = [
+            self._model.layers[layer].register_forward_hook(self._make_intervention_hook(fn))
+            for layer, fn in layer_transforms.items()
+        ]
+        try:
+            with torch.no_grad(), jlens.ActivationRecorder(
+                self._model.layers, at=[final_layer]
+            ) as recorder:
+                self._model.forward(input_ids)
+            final_hidden = recorder.activations[final_layer]
+        finally:
+            for handle in handles:
+                handle.remove()
+        logits = self._model.unembed(final_hidden)[0]
+        return logits.detach().float().cpu().numpy()
+
+    def ablate(self, prompt: str, layer_directions: dict[int, np.ndarray]) -> np.ndarray:
+        """Project each ``layer_directions[layer]`` direction out of the
+        residual stream at ``layer``, at every position, then run the real
+        remaining layers forward. Shape ``(seq_len, vocab_size)`` --
+        post-ablation logits at every position; verification code typically
+        only needs the last one (the model's next-token prediction)."""
+        transforms = {
+            layer: self._direction_transform(direction, mode="ablate")
+            for layer, direction in layer_directions.items()
+        }
+        return self._intervened_logits(prompt, transforms)
+
+    def steer(
+        self, prompt: str, layer_directions: dict[int, np.ndarray], alpha: float
+    ) -> np.ndarray:
+        """Add ``alpha`` times each ``layer_directions[layer]`` (unit-normalized
+        on-device) to the residual stream at ``layer``, at every position,
+        then run the real remaining layers forward. Shape ``(seq_len,
+        vocab_size)``."""
+        transforms = {
+            layer: self._direction_transform(direction, mode="add", alpha=alpha)
+            for layer, direction in layer_directions.items()
+        }
+        return self._intervened_logits(prompt, transforms)
