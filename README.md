@@ -9,18 +9,20 @@ Wraps [`jlens`](https://github.com/anthropics/jacobian-lens), the paper's
 reference implementation, with measurement and debugging tooling; does not
 reimplement the lens itself.
 
-**Status: M1-M5.** The `Profile` interface, a deterministic `StubLens`, and
-metrics (occupancy via Gradient Pursuit, loading, FVE, the five boundary
-signals) are in place, plus `FittedLens`, wrapping the pinned model
-(`Qwen/Qwen3.5-4B`) and its pre-fitted Jacobian lens. `debug.py` has
-`probe()`/`contrast()` (M3, `propose()` skipped as a stretch goal) and
-`verify_ablate()`/`verify_steer()` (M4). `report.py` (M5) renders a
-`Profile` summary alongside `jlens`'s own d3 slice view. See "A worked
-example" below for all of it run against the real model, and Limitations for
-what does and doesn't hold up on this particular model. M2's real-lens
-sanity checks have been run and reported there too; two of the three fail,
-and per CLAUDE.md that failure is being carried forward as a documented
-finding rather than fixed by tuning thresholds.
+**Status: M1-M5, including the M3 stretch goal.** The `Profile` interface, a
+deterministic `StubLens`, and metrics (occupancy via Gradient Pursuit,
+loading, FVE, the five boundary signals) are in place, plus `FittedLens`,
+wrapping the pinned model (`Qwen/Qwen3.5-4B`) and its pre-fitted Jacobian
+lens. `debug.py` has all three M3 modes (`probe()`, `contrast()`, and
+`propose()`) and M4's `verify_ablate()`/`verify_steer()`. `report.py` (M5)
+renders a `Profile` summary alongside `jlens`'s own d3 slice view. See "A
+worked example" below for all of it run against the real model, and
+Limitations for what does and doesn't hold up on this particular model. M2's
+real-lens sanity checks have been run and reported there too; two of the
+three fail, and per CLAUDE.md that failure is being carried forward as a
+documented finding rather than fixed by tuning thresholds -- along with a
+follow-up investigation into why (transport fidelity by depth), also in
+Limitations.
 
 ## Setup
 
@@ -122,7 +124,7 @@ full reasoning.
 
 ## `debug.py`: prompt debugging
 
-Two of CLAUDE.md's three M3 modes (`propose()` is a stretch goal, skipped):
+All three of CLAUDE.md's M3 modes, including the `propose()` stretch goal:
 
 ```python
 from subvocal import debug
@@ -134,21 +136,36 @@ result.peak_layer, result.peak_loading   # where loading("cat") peaks, and how h
 # contrast(): why did `failing_prompt` behave differently from `working_prompt`?
 result = debug.contrast(lens, working_prompt, failing_prompt)
 result.ranked(10)   # concepts strongly present in working, weak/absent in failing
+
+# propose(): what stands out in this one prompt, with no hypothesis at all?
+result = debug.propose(lens, prompt)
+result.ranked(10)   # concepts unusually present here vs. a baseline corpus
 ```
 
 `contrast()` requires the two prompts to tokenize to the same length (so
 position `i` means the same slot in both) and normalizes each concept's
 loading delta against how much that concept naturally varies across a
 baseline corpus, per CLAUDE.md — see the function docstring for the exact
-judgment calls (band selection, baseline corpus, normalization floor). Both
-functions warn (not raise) when a caller-supplied concept tokenizes to more
-than one token; `FittedLens` itself still raises if asked to resolve a
+judgment calls (band selection, baseline corpus, normalization floor). All
+three functions warn (not raise) when a caller-supplied concept tokenizes to
+more than one token; `FittedLens` itself still raises if asked to resolve a
 concept that isn't a real single token.
 
-`contrast()`'s default concept dictionary (a random vocab sample, same as
-`metrics.concept_dictionary`) works fine for the sanity checks in the
-Limitations section, but is a poor default for diagnosing one specific
-prompt pair: a random sample of a ~248k-token vocabulary is mostly
+`propose()` is the natural third mode: `probe()` needs a concept you already
+suspect, `contrast()` needs a second, token-aligned prompt to diff against;
+`propose()` needs neither. It z-scores each concept's loading in the one
+prompt against that same concept's mean and spread across the baseline
+corpus — the same normalization `contrast()` uses for its delta, just
+against a corpus instead of a second prompt. Run for real on the worked
+example's "small" prompt below with no concept list beyond the same
+hypothesis-driven set, it puts `trophy` and `suitcase` at the top, each at
+its own token position — genuine self-discovery of the prompt's actual
+content words, not something hand-fed to it.
+
+`contrast()`/`propose()`'s default concept dictionary (a random vocab
+sample, same as `metrics.concept_dictionary`) works fine for the sanity
+checks in the Limitations section, but is a poor default for diagnosing one
+specific prompt: a random sample of a ~248k-token vocabulary is mostly
 non-English fragments with no relevance to your prompt. Pass an explicit
 `concepts=[...]` list once you have a hypothesis — see the worked example.
 
@@ -240,6 +257,28 @@ deltas; this lens doesn't show clean evidence of the antecedent-tracking
 shift the small/large flip is classically used to probe (consistent with
 Limitations below).
 
+**`propose()`, same concepts, no working/failing pair at all** — just the
+"small" prompt on its own, scored against the baseline corpus:
+
+```python
+result = debug.propose(lens, working, concepts=concepts,
+                        layers=[4, 8, 12, 16, 20, 24, 28])
+```
+
+| concept | score | best layer | best position |
+|---|---|---|---|
+| ` trophy` | 5.62 | 8 | 1 (where "trophy" is) |
+| ` suitcase` | 5.42 | 8 | 7 (where "suitcase" is) |
+| ` fit` | 4.22 | 24 | 4 (where "fit" is) |
+| ` large` | 3.82 | 28 | 11 (where "small" is) |
+| ` small` | 2.88 | 8 | 12 (its own position) |
+
+With zero hypothesis about what this prompt is "about," `propose()`
+correctly surfaces `trophy` and `suitcase` — the actual content words — each
+peaking at its own token position, ahead of every other concept in the list
+including the literal word `small`. That's a genuine self-discovery result,
+not something hand-fed to it the way `contrast()`'s concept list was.
+
 **`verify_ablate()`**: does removing `tiny`'s direction from the *working*
 ("small") prompt do anything, versus a matched random direction?
 
@@ -317,9 +356,30 @@ open("artifacts/trophy_suitcase_small.html", "w").write(page)
   lens (`qwen-n1000`) converged well before its 1000-prompt budget
   (417 prompts, `stop_at_delta=0.002` reached), so this isn't simple
   data-starvation either. Nothing found points at a bug in this package.
-  The leading (untested further) explanation is scale: this is a 4B model
-  with a lens fit on a few hundred wikitext excerpts, not whatever scale the
-  paper's own experiments used — consistent with the next bullet.
+  The leading explanation is scale: this is a 4B model with a lens fit on a
+  few hundred wikitext excerpts, not whatever scale the paper's own
+  experiments used — consistent with the next two bullets.
+- **Follow-up: `J_l`'s transport fidelity, measured directly.** `readout()`
+  (and everything built on it) decodes `unembed(J_l @ h_l)` -- how well does
+  `J_l @ h_l` actually resemble the model's real final-layer residual
+  `h_final` from the same forward pass? Measured directly (cosine similarity
+  and R², pooled over positions across 3 prompts, `QWEN3_5_4B`'s real
+  32-layer lens): fidelity rises smoothly and monotonically with depth --
+  R² ≈ 0 at layers 0-2, R² ≈ 0.13-0.36 across layers 10-20 (the mid-depth
+  band `subsample_layers` samples most densely, and where the paper's
+  occupancy plateau lives), climbing to R² ≈ 0.70-0.83 by layers 28-30. No
+  jump or reversal anywhere that would suggest the hybrid linear-attention
+  layers broke the fit specifically -- this is the shape you'd expect from
+  *any* single averaged Jacobian linearizing a deep nonlinear stack, the
+  paper's models presumably included. It does mean that at exactly the
+  depths occupancy is measured, `J_l @ h_l` explains under 40% of
+  `h_final`'s variance -- most of what the network still goes on to do with
+  that residual is, by construction, invisible to a purely linear readout
+  there. A concrete, quantified mechanism consistent with the scale
+  explanation above, though it doesn't distinguish "this model's workspace
+  really is narrower" from "a bigger model would show the same fidelity
+  curve and still hit a 25-concept plateau anyway" -- that needs a second
+  model to compare against, which doesn't fit this machine (see below).
 - **Weak occupancy doesn't mean weak causal power.** M4's verification (see
   the worked example) found individual concept directions with real,
   specific causal effects on the model's output — ablating one measurably
