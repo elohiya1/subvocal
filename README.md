@@ -1,5 +1,7 @@
 # subvocal
 
+[![tests](https://github.com/elohiya1/subvocal/actions/workflows/tests.yml/badge.svg)](https://github.com/elohiya1/subvocal/actions/workflows/tests.yml)
+
 A toolkit for asking what a language model is actually representing
 internally, and why a specific prompt worked or didn't.
 
@@ -125,6 +127,8 @@ subvocal/
   debug.py      contrast pairs, ranking, ablation + steering verification
   report.py     HTML output
 tests/
+scripts/        ad hoc real-lens scripts (M2 sanity check, transport fidelity)
+FINDINGS.md     what those scripts found, and how to reproduce it
 modal_fit.py    lives outside the package, runs once
 ```
 
@@ -393,6 +397,9 @@ open("artifacts/trophy_suitcase_small.html", "w").write(page)
 ```
 
 ## Limitations
+
+Full numbers and how to reproduce them: [`FINDINGS.md`](FINDINGS.md);
+scripts are in [`scripts/`](scripts/).
 
 - **Single-token vocabulary.** The lens only reads out individual tokens;
   multi-token concepts raise at the API boundary (`FittedLens.concept_direction`
