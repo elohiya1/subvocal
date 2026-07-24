@@ -1,4 +1,5 @@
-"""Tests for debug.py's probe(), contrast(), verify_ablate(), and verify_steer().
+"""Tests for debug.py's probe(), contrast(), propose(), verify_ablate(), and
+verify_steer().
 
 verify_ablate/verify_steer need a real forward-pass re-run past the
 intervened layer, so unlike probe/contrast they're tested against the
@@ -208,6 +209,74 @@ class TestContrast:
             baseline_prompts=[baseline],
         )
         assert band_zero_only.hits[0].concept == "other"
+
+
+# --------------------------------------------------------------------------
+# propose
+# --------------------------------------------------------------------------
+
+
+class TestPropose:
+    def test_rejects_band_outside_layers(self):
+        lens = StubLens(n_layers=8, d_model=8, vocab_size=4)
+        with pytest.raises(ValueError, match="band"):
+            debug.propose(lens, "a b c", layers=[0, 3, 7], band=(100, 200))
+
+    def test_default_concepts_uses_whole_small_vocab(self):
+        lens = StubLens(n_layers=4, d_model=8, vocab_size=6)
+        result = debug.propose(lens, "a b", layers=[0, 3])
+        assert {h.concept for h in result.hits} == set(lens.vocab)
+
+    def test_hits_sorted_descending(self):
+        lens = StubLens(n_layers=4, d_model=8, vocab_size=6)
+        result = debug.propose(lens, "a b", layers=[0, 3])
+        scores = [h.score for h in result.hits]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_ranked_returns_top_k(self):
+        lens = StubLens(n_layers=4, d_model=8, vocab_size=6)
+        result = debug.propose(lens, "a b", layers=[0, 3])
+        top2 = result.ranked(2)
+        assert [h.concept for h in top2] == [h.concept for h in result.hits[:2]]
+
+    def test_warns_on_multi_token_explicit_concept(self):
+        lens = StubLens(n_layers=4, d_model=8, vocab_size=8)
+        with pytest.warns(UserWarning, match="single token"):
+            debug.propose(lens, "a b", concepts=["multi word concept"], layers=[0])
+
+    def test_surfaces_the_concept_unusually_present_here(self):
+        # "target" is at its baseline-typical value nowhere special *except*
+        # this prompt, where it's exactly aligned -- propose() should still
+        # rank it first even though nothing is being diffed against a second
+        # prompt.
+        lens = _ToyLens()
+        prompt = "p"
+        lens.set_residual(prompt, 0, 1, [1.0, 0.0, 0.0, 0.0])
+
+        baselines = ["b0", "b1", "b2"]
+        baseline_vecs = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+        for b, vec in zip(baselines, baseline_vecs):
+            lens.set_residual(b, 0, 1, vec)
+
+        result = debug.propose(
+            lens,
+            prompt,
+            concepts=["target", "other", "noise1", "noise2"],
+            layers=[0, 1],
+            baseline_prompts=baselines,
+        )
+        assert result.hits[0].concept == "target"
+        assert result.hits[0].best_layer == 1
+        assert result.hits[0].score > 0
+        # "noise2" never varies across baseline or this prompt (always
+        # orthogonal) -- std_floor should keep its z-score at exactly 0,
+        # not blow up.
+        noise2 = next(h for h in result.hits if h.concept == "noise2")
+        assert noise2.score == pytest.approx(0.0, abs=1e-5)
 
 
 # --------------------------------------------------------------------------

@@ -1,6 +1,6 @@
-"""Prompt debugging built on ``metrics.py``: M3's :func:`probe` and
-:func:`contrast` (``propose()`` is a stretch goal and is not implemented
-here), plus M4's :func:`verify_ablate` and :func:`verify_steer`.
+"""Prompt debugging built on ``metrics.py``: M3's :func:`probe`,
+:func:`contrast`, and :func:`propose` (the stretch goal), plus M4's
+:func:`verify_ablate` and :func:`verify_steer`.
 
 M3's two functions are typed against :class:`~subvocal.metrics.MetricsLens`
 and run against either lens. M4's two are typed against
@@ -162,6 +162,71 @@ def probe(
 
 
 # --------------------------------------------------------------------------
+# Shared by contrast() and propose(): layers/band/concepts resolution and
+# baseline-corpus scoring.
+# --------------------------------------------------------------------------
+
+
+def _resolve_layers_and_band(
+    lens: MetricsLens, layers: Sequence[int] | None, band: tuple[int, int] | None
+) -> tuple[list[int], tuple[int, int], np.ndarray]:
+    layers = list(layers) if layers is not None else subsample_layers(lens.n_layers)
+    band = band if band is not None else (min(layers), max(layers))
+    band_mask = np.array([band[0] <= l <= band[1] for l in layers])
+    if not band_mask.any():
+        raise ValueError(f"band={band} does not overlap any scanned layer in {layers}")
+    return layers, band, band_mask
+
+
+def _resolve_concepts(
+    lens: MetricsLens,
+    concepts: Sequence[str] | None,
+    layers: Sequence[int],
+    max_atoms: int,
+    seed: int,
+) -> list[str]:
+    if concepts is not None:
+        concepts = list(concepts)
+        for c in concepts:
+            _warn_if_multi_token(lens, c)
+        return concepts
+    names, _ = concept_dictionary(lens, layers[0], max_atoms=max_atoms, seed=seed)
+    return names
+
+
+def _resolve_baseline(
+    lens: MetricsLens, baseline_prompts: Sequence[str] | None
+) -> tuple[list[str], list[list[int]]]:
+    prompts = (
+        list(baseline_prompts) if baseline_prompts is not None else DEFAULT_BASELINE_PROMPTS
+    )
+    positions = [list(range(len(lens.encode(p)))) for p in prompts]
+    return prompts, positions
+
+
+def _pooled_baseline_scores(
+    lens: MetricsLens,
+    D: np.ndarray,
+    layer: int,
+    baseline_prompts: Sequence[str],
+    baseline_positions: Sequence[Sequence[int]],
+) -> np.ndarray:
+    """Cosine loading of every atom in ``D`` against every ``(baseline
+    prompt, position)`` at ``layer``: shape ``(n_atoms, total_baseline_pos)``.
+    Shared by :func:`contrast` (which only needs the spread, per concept per
+    layer) and :func:`propose` (which needs the center too, to tell "unusually
+    high for this prompt" apart from "just generically high everywhere")."""
+    baseline_h = np.concatenate(
+        [
+            np.stack([lens.residual(p, pos, layer) for pos in pos_list])
+            for p, pos_list in zip(baseline_prompts, baseline_positions)
+        ],
+        axis=0,
+    )  # (total_baseline_pos, d_model)
+    return cosine_loading(baseline_h[None, :, :], D[:, None, :])
+
+
+# --------------------------------------------------------------------------
 # contrast
 # --------------------------------------------------------------------------
 
@@ -301,23 +366,9 @@ def contrast(
         )
     positions = list(range(len(working_toks)))
 
-    layers = list(layers) if layers is not None else subsample_layers(lens.n_layers)
-    band = band if band is not None else (min(layers), max(layers))
-    band_mask = np.array([band[0] <= l <= band[1] for l in layers])
-    if not band_mask.any():
-        raise ValueError(f"band={band} does not overlap any scanned layer in {layers}")
-
-    if concepts is not None:
-        concepts = list(concepts)
-        for c in concepts:
-            _warn_if_multi_token(lens, c)
-    else:
-        concepts, _ = concept_dictionary(lens, layers[0], max_atoms=max_atoms, seed=seed)
-
-    baseline_prompts = (
-        list(baseline_prompts) if baseline_prompts is not None else DEFAULT_BASELINE_PROMPTS
-    )
-    baseline_positions = [list(range(len(lens.encode(p)))) for p in baseline_prompts]
+    layers, band, band_mask = _resolve_layers_and_band(lens, layers, band)
+    concepts = _resolve_concepts(lens, concepts, layers, max_atoms, seed)
+    baseline_prompts, baseline_positions = _resolve_baseline(lens, baseline_prompts)
 
     n_concepts, n_pos, n_layer = len(concepts), len(positions), len(layers)
     normalized = np.zeros((n_concepts, n_pos, n_layer), dtype=np.float32)
@@ -330,14 +381,9 @@ def contrast(
         working_score = cosine_loading(working_h[None, :, :], D[:, None, :])  # (n_concepts, n_pos)
         failing_score = cosine_loading(failing_h[None, :, :], D[:, None, :])
 
-        baseline_h = np.concatenate(
-            [
-                np.stack([lens.residual(p, pos, layer) for pos in pos_list])
-                for p, pos_list in zip(baseline_prompts, baseline_positions)
-            ],
-            axis=0,
-        )  # (total_baseline_pos, d_model)
-        baseline_score = cosine_loading(baseline_h[None, :, :], D[:, None, :])
+        baseline_score = _pooled_baseline_scores(
+            lens, D, layer, baseline_prompts, baseline_positions
+        )
         baseline_std = np.maximum(baseline_score.std(axis=1), std_floor)  # (n_concepts,)
 
         normalized[:, :, li] = (working_score - failing_score) / baseline_std[:, None]
@@ -362,6 +408,162 @@ def contrast(
     return ContrastResult(
         working_prompt=working_prompt,
         failing_prompt=failing_prompt,
+        layers=layers,
+        band=band,
+        hits=hits,
+    )
+
+
+# --------------------------------------------------------------------------
+# propose
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class ConceptProposal:
+    """One concept's standing-out-ness in a single prompt. ``eq=False``: see
+    :class:`ProbeResult`.
+
+    Attributes:
+        concept: The concept.
+        score: The largest z-score (this prompt's loading, minus the
+            baseline corpus's mean loading for this concept, over the
+            baseline's std) within the scanned ``band``, across all
+            positions and band layers. Positive means loaded higher than
+            this concept typically is; this is not a working-vs-failing
+            delta the way :attr:`ConceptContrast.score` is, so a negative
+            score is a meaningful ("unusually low here") result too, not
+            just "not a hit."
+        best_position: Position (caller's index) where ``score`` occurs.
+        best_layer: Layer (caller's index) where ``score`` occurs.
+        trace: The z-score over every scanned position/layer -- not just the
+            band -- shape ``(n_pos, n_layer)``.
+    """
+
+    concept: str
+    score: float
+    best_position: int
+    best_layer: int
+    trace: np.ndarray
+
+
+@dataclass(frozen=True)
+class ProposeResult:
+    """Concepts ranked by how much they stand out in one prompt, with no
+    user-supplied hypothesis (:func:`probe`) or second prompt to diff against
+    (:func:`contrast`).
+
+    Attributes:
+        prompt: The prompt scanned.
+        layers: Layers scanned.
+        band: ``(lo, hi)`` layer-index bounds (inclusive)
+            :attr:`ConceptProposal.score` was maximized over.
+        hits: Every scanned concept, ranked by :attr:`ConceptProposal.score`
+            descending -- most unusually-present first.
+    """
+
+    prompt: str
+    layers: list[int]
+    band: tuple[int, int]
+    hits: list[ConceptProposal]
+
+    def ranked(self, k: int = 10) -> list[ConceptProposal]:
+        """Top ``k`` concepts by :attr:`ConceptProposal.score`."""
+        return self.hits[:k]
+
+
+def propose(
+    lens: MetricsLens,
+    prompt: str,
+    *,
+    concepts: Sequence[str] | None = None,
+    layers: Sequence[int] | None = None,
+    band: tuple[int, int] | None = None,
+    baseline_prompts: Sequence[str] | None = None,
+    max_atoms: int = DEFAULT_DICTIONARY_SIZE,
+    seed: int = 0,
+    std_floor: float = 0.05,
+) -> ProposeResult:
+    """Automatically surface which concepts stand out in ``prompt``'s
+    J-space -- CLAUDE.md's stretch-goal third M3 mode.
+
+    :func:`probe` needs a concept the caller already suspects; :func:`contrast`
+    needs a second, token-aligned prompt to diff against. ``propose`` needs
+    neither: it scores each concept's loading in ``prompt`` as a z-score
+    against that same concept's loading across ``baseline_prompts`` (mean and
+    std, floored at ``std_floor``), the same normalization :func:`contrast`
+    uses for its delta. This is what keeps a concept that's just generically
+    high-loading on *any* prompt (e.g. one whose vocab row happens to have a
+    large norm) from drowning out concepts that are unusually present in
+    this specific prompt.
+
+    Computed layer-major, same reasoning as :func:`contrast`.
+
+    Args:
+        lens: Lens to read out from.
+        prompt: The prompt to scan.
+        concepts: Concepts to scan. Defaults to the same size-``max_atoms``
+            vocab sample :func:`~subvocal.metrics.concept_dictionary` draws
+            for occupancy.
+        layers: Layers to scan. Defaults to
+            :func:`~subvocal.metrics.subsample_layers`.
+        band: ``(lo, hi)`` layer-index bounds (inclusive) to rank
+            :attr:`ConceptProposal.score` within. Defaults to all of
+            ``layers``.
+        baseline_prompts: Corpus for the z-score. Defaults to
+            :data:`DEFAULT_BASELINE_PROMPTS`.
+        max_atoms: Concept-dictionary size when ``concepts`` isn't given.
+        seed: Concept-dictionary sampling seed.
+        std_floor: Minimum per-concept-per-layer baseline std.
+
+    Returns:
+        A :class:`ProposeResult` ranking every scanned concept.
+
+    Raises:
+        ValueError: ``band`` doesn't overlap any scanned layer.
+    """
+    positions = list(range(len(lens.encode(prompt))))
+
+    layers, band, band_mask = _resolve_layers_and_band(lens, layers, band)
+    concepts = _resolve_concepts(lens, concepts, layers, max_atoms, seed)
+    baseline_prompts, baseline_positions = _resolve_baseline(lens, baseline_prompts)
+
+    n_concepts, n_pos, n_layer = len(concepts), len(positions), len(layers)
+    z_scores = np.zeros((n_concepts, n_pos, n_layer), dtype=np.float32)
+
+    for li, layer in enumerate(layers):
+        _, D = concept_dictionary(lens, layer, concepts=concepts)  # (n_concepts, d_model)
+
+        h = np.stack([lens.residual(prompt, p, layer) for p in positions])
+        score = cosine_loading(h[None, :, :], D[:, None, :])  # (n_concepts, n_pos)
+
+        baseline_score = _pooled_baseline_scores(
+            lens, D, layer, baseline_prompts, baseline_positions
+        )
+        baseline_mean = baseline_score.mean(axis=1)  # (n_concepts,)
+        baseline_std = np.maximum(baseline_score.std(axis=1), std_floor)
+
+        z_scores[:, :, li] = (score - baseline_mean[:, None]) / baseline_std[:, None]
+
+    band_layers = np.array(layers)[band_mask]
+    band_values = z_scores[:, :, band_mask]  # (n_concepts, n_pos, n_band_layer)
+
+    hits = []
+    for ci, concept in enumerate(concepts):
+        pi, bi = np.unravel_index(int(np.argmax(band_values[ci])), band_values[ci].shape)
+        hits.append(
+            ConceptProposal(
+                concept=concept,
+                score=float(band_values[ci, pi, bi]),
+                best_position=positions[pi],
+                best_layer=int(band_layers[bi]),
+                trace=z_scores[ci],
+            )
+        )
+    hits.sort(key=lambda h: h.score, reverse=True)
+
+    return ProposeResult(
+        prompt=prompt,
         layers=layers,
         band=band,
         hits=hits,
