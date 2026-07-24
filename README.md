@@ -9,14 +9,16 @@ Wraps [`jlens`](https://github.com/anthropics/jacobian-lens), the paper's
 reference implementation, with measurement and debugging tooling; does not
 reimplement the lens itself.
 
-**Status: M1 + M2 + M3 (partial).** The `Profile` interface, a deterministic
-`StubLens`, and metrics (occupancy via Gradient Pursuit, loading, FVE, the
-five boundary signals) are in place, plus `FittedLens`, wrapping the pinned
-model (`Qwen/Qwen3.5-4B`) and its pre-fitted Jacobian lens. `debug.py` adds
-`probe()` and `contrast()`; `propose()` is a stretch goal and was skipped.
-Ablation/steering verification (M4) and the HTML report (M5) are not yet
-built — see `CLAUDE.md` for the milestone plan. M2's real-lens sanity checks
-have been run and reported — see Limitations below; two of the three fail,
+**Status: M1-M5.** The `Profile` interface, a deterministic `StubLens`, and
+metrics (occupancy via Gradient Pursuit, loading, FVE, the five boundary
+signals) are in place, plus `FittedLens`, wrapping the pinned model
+(`Qwen/Qwen3.5-4B`) and its pre-fitted Jacobian lens. `debug.py` has
+`probe()`/`contrast()` (M3, `propose()` skipped as a stretch goal) and
+`verify_ablate()`/`verify_steer()` (M4). `report.py` (M5) renders a
+`Profile` summary alongside `jlens`'s own d3 slice view. See "A worked
+example" below for all of it run against the real model, and Limitations for
+what does and doesn't hold up on this particular model. M2's real-lens
+sanity checks have been run and reported there too; two of the three fail,
 and per CLAUDE.md that failure is being carried forward as a documented
 finding rather than fixed by tuning thresholds.
 
@@ -58,11 +60,9 @@ tests/
 modal_fit.py    lives outside the package, runs once
 ```
 
-`lens.py`, `metrics.py`, `profile.py`, and `debug.py` exist so far (`debug.py`
-currently has `probe()`/`contrast()` only; ablation/steering verification is
-M4). `report.py` is next; `modal_fit.py` may not be needed at all, since
-subvocal uses the paper's pre-fitted Qwen3.5-4B lens rather than fitting its
-own.
+All five package modules exist. `modal_fit.py` was never needed: subvocal
+uses the paper's pre-fitted Qwen3.5-4B lens from the Hub rather than fitting
+its own.
 
 ## The `Profile` interface
 
@@ -82,14 +82,14 @@ sequence position, actual layer number), not array offsets.
 
 ### `StubLens`
 
-Until a fitted lens exists at `artifacts/lens.pt`, `subvocal.lens.StubLens`
-stands in for it. It fabricates a residual vector per `(prompt, position,
-layer)` and a J-lens direction per `(concept, layer)` — both deterministic,
-seeded unit vectors — and derives `readout`/`topk` from their cosine
-similarity, the same relationship a real lens has between its transport and
-its decode. This lets metrics and tests be built and exercised before the
-real lens lands, without depending on fake data that only happens to have the
-right shape.
+`subvocal.lens.StubLens` stands in for `FittedLens`: same readout surface,
+deterministic fake data, no model or network access needed. It fabricates a
+residual vector per `(prompt, position, layer)` and a J-lens direction per
+`(concept, layer)` — both deterministic, seeded unit vectors — and derives
+`readout`/`topk` from their cosine similarity, the same relationship a real
+lens has between its transport and its decode. This is what `metrics.py`'s
+and `debug.py`'s test suites run against; `verify_ablate`/`verify_steer`
+need a real forward pass and don't work with it (see M4 below).
 
 ```python
 from subvocal.lens import StubLens
@@ -145,6 +145,148 @@ functions warn (not raise) when a caller-supplied concept tokenizes to more
 than one token; `FittedLens` itself still raises if asked to resolve a
 concept that isn't a real single token.
 
+`contrast()`'s default concept dictionary (a random vocab sample, same as
+`metrics.concept_dictionary`) works fine for the sanity checks in the
+Limitations section, but is a poor default for diagnosing one specific
+prompt pair: a random sample of a ~248k-token vocabulary is mostly
+non-English fragments with no relevance to your prompt. Pass an explicit
+`concepts=[...]` list once you have a hypothesis — see the worked example.
+
+### `verify_ablate()` / `verify_steer()` (M4)
+
+Necessity and sufficiency checks, always reported against a required
+random-direction control (CLAUDE.md: "Without it any effect could be generic
+perturbation damage"). Both need a real forward-pass re-run past the
+intervened layer, which only `FittedLens` can do — `StubLens` doesn't
+implement them.
+
+```python
+# verify_ablate(): does removing `concept`'s direction actually change the model?
+result = debug.verify_ablate(lens, prompt, " tiny")
+result.skipped            # True if `concept` was already in the clean top-10 (paper convention)
+result.concept_outcome    # AblationOutcome: did top-1 change, how much was it suppressed
+result.control_outcome    # same, for a matched random direction -- always reported side by side
+
+# verify_steer(): does adding `concept`'s direction in make it "recover" into the output?
+result = debug.verify_steer(lens, prompt, " tiny", alpha=6.0)
+result.concept_outcome    # SteerOutcome: rank before/after, did it enter the top-k
+result.control_outcome    # same, for a matched random direction
+```
+
+`verify_ablate` skips entirely when `concept` is already in the clean
+forward pass's top-10 — ablating it there would just remove it from its own
+imminent output, not test whether it was used in internal reasoning, per
+CLAUDE.md. Both exclude the model's actual final layer from the
+intervention band: ablating/steering there is just editing the logits
+directly, not a hidden-state intervention.
+
+### `report.py` (M5)
+
+One HTML report per prompt: a `Profile` summary (boundary signals, FVE/
+occupancy per layer, concept loading peaks — plain tables, no charting) atop
+`jlens.vis`'s own interactive d3 slice view, embedded in an iframe
+unmodified. CLAUDE.md: "reusing the d3 slice view from ../jacobian-lens. Do
+not build a new visualization."
+
+```python
+from subvocal import report
+
+page = report.build_report(lens, prompt, concepts=[" tiny", " small", " large"])
+open("report.html", "w").write(page)
+```
+
+## A worked example
+
+A real diagnosed case, run against `FittedLens.from_pretrained(QWEN3_5_4B)`.
+Two token-aligned (14 tokens each) minimal-pair prompts:
+
+```
+working: "The trophy did not fit in the suitcase because it was too small."
+failing: "The trophy did not fit in the suitcase because it was too large."
+```
+
+Neither is a "failure" in the sense of the model outputting something overtly
+wrong — this small base model's raw next-token continuation after a period is
+almost always generic (`"\n"`, connective words), regardless of prompt. The
+interesting question is whether the two prompts differ *internally*, even
+when their surface output doesn't.
+
+**`contrast()`, hypothesis-driven concepts** (the default random-vocab
+dictionary is noise for a single prompt pair — see above):
+
+```python
+concepts = [" trophy", " suitcase", " small", " large", " big", " fit",
+            " broken", " heavy", " size", " tiny", " huge", " box"]
+result = debug.contrast(lens, working, failing, concepts=concepts,
+                         layers=[4, 8, 12, 16, 20, 24, 28])
+```
+
+| concept | score | best layer |
+|---|---|---|
+| ` tiny` | 1.68 | 16 |
+| ` small` | 1.56 | 12 |
+| ` big` | 0.94 | 8 |
+| ` broken` | 0.88 | 8 |
+| ` fit` | 0.62 | 8 |
+| ` suitcase` | 0.56 | 28 |
+| ` trophy` | 0.39 | 16 |
+
+`small`, unsurprisingly, tops the list — it's the literal word that differs.
+More interesting: `tiny` ranks *above* it, and `tiny` never appears in either
+prompt. `contrast()` surfaced a genuine semantic neighbor of the concept that
+differs, not just an echo of the input tokens. The two entities (`trophy`,
+`suitcase`) — the classic Winograd-schema referents — show much weaker
+deltas; this lens doesn't show clean evidence of the antecedent-tracking
+shift the small/large flip is classically used to probe (consistent with
+Limitations below).
+
+**`verify_ablate()`**: does removing `tiny`'s direction from the *working*
+("small") prompt do anything, versus a matched random direction?
+
+```python
+debug.verify_ablate(lens, working, " tiny", layers=[4, 8, 12, 16, 20, 24, 28])
+```
+
+|  | top-1 logit before | top-1 logit after | Δ |
+|---|---|---|---|
+| concept (`tiny`) | 18.625 | 18.250 | **-0.375** |
+| random control | 18.625 | 18.750 | +0.125 |
+
+Ablating `tiny` measurably suppresses the model's own top prediction; the
+random-direction control doesn't (if anything, it nudges the other way).
+Top-1 itself (`"\n"`) doesn't flip — a generic connective token this far
+into a full vocabulary is a high bar to dislodge with one concept's removal
+— but the *specific vs. generic* separation is exactly what the required
+control is for.
+
+**`verify_steer()`**: does adding `tiny`'s direction *into* the failing
+("large") prompt — where it's currently almost entirely absent — recover it?
+
+```python
+debug.verify_steer(lens, failing, " tiny", alpha=6.0, layers=[4, 8, 12, 16, 20, 24, 28])
+```
+
+|  | rank before | rank after | entered top-25 |
+|---|---|---|---|
+| concept (`tiny`) | 9773 | **0** | yes |
+| random control | 9773 | 17901 | no |
+
+Steering `tiny` in doesn't just nudge it — it becomes the model's literal
+top prediction (rank 0), while the matched random control makes it *less*
+likely. This is the clean result in this worked example: `tiny`'s direction
+has real, specific causal power over the model's output; a same-magnitude
+random perturbation does not.
+
+Generate the full HTML report (`Profile` summary + `jlens`'s interactive
+slice view) for either variant with the `report.py` snippet above --
+`artifacts/` is gitignored (run output, not a tracked asset), so it isn't
+checked into the repo:
+
+```python
+page = report.build_report(lens, working, concepts=concepts, layers=[4, 8, 12, 16, 20, 24, 28, 31])
+open("artifacts/trophy_suitcase_small.html", "w").write(page)
+```
+
 ## Limitations
 
 - **Single-token vocabulary.** The lens only reads out individual tokens;
@@ -178,6 +320,16 @@ concept that isn't a real single token.
   The leading (untested further) explanation is scale: this is a 4B model
   with a lens fit on a few hundred wikitext excerpts, not whatever scale the
   paper's own experiments used — consistent with the next bullet.
+- **Weak occupancy doesn't mean weak causal power.** M4's verification (see
+  the worked example) found individual concept directions with real,
+  specific causal effects on the model's output — ablating one measurably
+  suppressed the top prediction while a matched random direction didn't;
+  steering one in moved a token from rank ~9800 to rank 0 while a matched
+  random direction moved it further away. That's the mechanism working as
+  intended. It's the *occupancy/boundary* read on this model and lens — how
+  many concepts, arranged into what depth structure — that doesn't match the
+  paper's numbers, not the underlying "does a concept's direction do
+  anything" question.
 - **Absence from the J-space is not proof of absence.** A concept missing
   from `topk`/`occupancy` may have been used by the model outside the
   workspace; see the paper's line-counting selectivity experiments.
