@@ -27,11 +27,15 @@ Limitations.
 ## Setup
 
 ```bash
+git clone https://github.com/anthropics/jacobian-lens.git
 uv sync --extra dev
 ```
 
-This installs `jlens` as an editable local dependency from `jacobian-lens/`,
-plus torch, transformers, and numpy.
+`jacobian-lens/` is gitignored (it's a separate upstream checkout with its
+own `.git`, not part of this repo) -- `uv sync` installs `jlens` as an
+editable local dependency from that path, so it has to exist first, or
+`uv sync` fails immediately with `Distribution not found`. This also
+installs torch, transformers, and numpy.
 
 MPS (Apple Silicon) requires the fallback env var to be set before any
 torch-heavy import:
