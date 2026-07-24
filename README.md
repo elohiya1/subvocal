@@ -1,13 +1,26 @@
 # subvocal
 
-A workspace occupancy profiler and prompt debugger built on the Jacobian lens
-from Anthropic's [*Verbalizable Representations Form a Global Workspace in
-Language Models*](https://transformer-circuits.pub/2026/workspace/index.html)
-(2026). Not affiliated with Anthropic.
+A toolkit for asking what a language model is actually representing
+internally, and why a specific prompt worked or didn't.
 
-Wraps [`jlens`](https://github.com/anthropics/jacobian-lens), the paper's
-reference implementation, with measurement and debugging tooling; does not
-reimplement the lens itself.
+It's built on the Jacobian lens from Anthropic's [*Verbalizable
+Representations Form a Global Workspace in Language
+Models*](https://transformer-circuits.pub/2026/workspace/index.html) (2026):
+a linear readout that decodes a residual stream into ranked tokens,
+revealing a small set of concepts the model routes information through
+mid-network. subvocal wraps [`jlens`](https://github.com/anthropics/jacobian-lens),
+the paper's reference implementation, and adds:
+
+- **metrics** — how much of that workspace a prompt occupies, and where
+  (occupancy, loading, FVE, boundary signals)
+- **debugging** — probe a specific concept, diff a working/failing prompt
+  pair, or auto-discover what stands out in one
+- **verification** — confirm a diagnosis causally via ablation/steering,
+  not just correlation
+- **reporting** — an HTML view combining the above with the paper's own
+  interactive slice view
+
+Not affiliated with Anthropic.
 
 **Status: M1-M5, including the M3 stretch goal.** The `Profile` interface, a
 deterministic `StubLens`, and metrics (occupancy via Gradient Pursuit,
@@ -27,15 +40,18 @@ Limitations.
 ## Setup
 
 ```bash
-git clone https://github.com/anthropics/jacobian-lens.git
+git clone --recurse-submodules https://github.com/elohiya1/subvocal.git
+cd subvocal
 uv sync --extra dev
 ```
 
-`jacobian-lens/` is gitignored (it's a separate upstream checkout with its
-own `.git`, not part of this repo) -- `uv sync` installs `jlens` as an
-editable local dependency from that path, so it has to exist first, or
-`uv sync` fails immediately with `Distribution not found`. This also
-installs torch, transformers, and numpy.
+`jacobian-lens/` is a git submodule (a separate upstream checkout with its
+own history, pinned to a specific commit) -- `--recurse-submodules` fetches
+it as part of the clone, since `uv sync` needs it to exist first to install
+`jlens` as an editable local dependency. Already have a clone without it?
+Run `git submodule update --init` to fetch it after the fact. This step
+also installs torch, transformers, and numpy (~2-3GB of packages, mostly
+torch).
 
 MPS (Apple Silicon) requires the fallback env var to be set before any
 torch-heavy import:
@@ -45,7 +61,53 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 ```
 
 `subvocal.lens.resolve_device()` raises rather than silently continuing if
-MPS is available and this isn't set.
+MPS is available and this isn't set. On CUDA or CPU-only machines this
+doesn't apply and nothing extra is needed.
+
+## Quickstart
+
+Try the interface with `StubLens` first -- deterministic fake data, no
+model download, works the moment `uv sync` finishes:
+
+```python
+from subvocal.lens import StubLens
+from subvocal.metrics import build_profile
+
+lens = StubLens(n_layers=24, d_model=64, vocab_size=64)
+profile = build_profile(lens, "the quick brown fox", concepts=["tok0", "tok1"])
+profile.occupancy()          # (n_pos, n_layer) ndarray
+profile.boundaries()         # the five signals + disagreement flag
+profile.topk(pos=0, layer=12, k=5)
+```
+
+Once that's working, swap in the real model -- see "Resource requirements"
+right below before you do, since this step downloads several gigabytes:
+
+```python
+from subvocal.lens import FittedLens, QWEN3_5_4B
+
+lens = FittedLens.from_pretrained(QWEN3_5_4B)   # downloads on first call, then cached
+profile = build_profile(lens, "the quick brown fox", concepts=[" fox", " dog"])
+```
+
+Same `Profile` interface either way -- everything in `metrics.py`, `debug.py`,
+and `report.py` runs unchanged against both lenses (`verify_ablate`/
+`verify_steer` are the one exception; they need a real model, see M4 below).
+
+### Resource requirements (`FittedLens` only)
+
+- **Disk**: ~9.3GB for the model weights (bf16) + ~400MB for the fitted
+  lens, cached under `~/.cache/huggingface` after the first download.
+- **RAM**: rough floor ~15GB (9.3GB model + ~2.5GB unembedding matrix +
+  ~2.5GB capped direction cache, see the `FittedLens` class docstring), plus
+  general overhead. Only tested on this project's 25.7GB dev machine, so
+  treat 15GB as an estimate, not a verified minimum.
+- **Time**: the first `from_pretrained()` call downloads the model and lens
+  from the Hub (a few minutes depending on connection); every call after
+  that reuses the local cache and loads in a few seconds.
+- **No account/token required** -- the model and lens are public. Setting
+  `HF_TOKEN` avoids an "unauthenticated requests" warning and gets higher
+  Hub rate limits, but isn't necessary to run anything here.
 
 ## Tests
 
